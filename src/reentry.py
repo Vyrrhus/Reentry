@@ -1,274 +1,397 @@
+# @author : Baptiste DESOUBRIE
+"""
+PRELIMINARY RE-ENTRY SIMULATION
+
+This program aims to modelise the trajectory of an object within a planetary 
+atmosphere. It can either perform a balistic trajectory, a lifting reentry, or
+even compute orbital decay, even though the accuracy needed for such a problem
+should be improved.
+
+To solve this problem, the Fundamental Dynamics Principle is solved, given
+the few forces that are considered to be applied on the point-mass vehicle.
+Those forces are as follow :
+    - Weight, towards the center of the planet (not its center of mass, thus 
+      neglecting J2 approximation)
+    - Drag, in the opposite direction of the velocity vector
+    - Lift, normal to the Drag and away from the planet.
+
+Boundary conditions are given by the user in the "INITIAL CONDITIONS" section.
+Those are :
+    - planetary constants (supposed to be constant) such as the radius, the 
+      gravity on the ground.
+    - atmosphere model given by a density function
+    - the object parameters : surface area, Cx & Cz (supposed to be constant),
+      mass...
+    - the initial flight conditions : altitude, velocity, flight-path angle
+    - the simulation settings : timestep size, maximum time for the simulation
+      to run, Earth orientation for the plots
+
+The simulation provides a set of different plots, as with the basic 
+informations one's need about the re-entry (if the object modelised effectively 
+hit the ground).
+"""
+
 import numpy as np
 from matplotlib import pyplot
 import math
 
-###########################################
-#               FUNCTIONS                 #
-###########################################
-#     MATH OPERATIONS    #
-##########################
-def coordinate_switch(u, y): # u = {ux, uy} ; y is a list of angle [°]
-    u1 = u[0]
-    u2 = u[1]
-    for i in range(len(y)):
-        y[i] = y[i] / 180 * np.pi
-        v1 = u1 * np.cos(y[i]) - u2 * np.sin(y[i])
-        v2 = u1 * np.sin(y[i]) + u2 * np.cos(y[i])
-        u1 = v1
-        u2 = v2
-    return np.array([v1, v2])
-    # returns the same vector in input with a different coordinate system.
-    # The coordinate system in output is a rotation by y° of the one in input
-    # One can rotate more than 1 time using a list of angles (but always along the same axis)
+# -----------------------------------------------------------------
+#   FUNCTIONS :
+#    - simulation
+#    - density_USSA76
+# -----------------------------------------------------------------
 
-def module(u): # u is a vector
-    S = 0
-    for k in range(len(u)):
-        S = S + u[k]**2
-    return np.sqrt(S)
-    # returns the module 2 of the vector in input
-
-def vec_angle(u):   # u = {ux, uy}
-    U = module(u)
-    y = math.acos(u[0]/U)
-    if u[1] < 0:
-        y = -y
-    return y / np.pi * 180
-    # return the angle between the vector & the x-axis of the coordinate system which is used to express the vector
-
-##########################
-#    Atmospheric model   #
-##########################
-def lift(p, V): # p: density [kg/m3] ; V: velocity [m/s]
-    return 1/2 * area * Cz * p * V**2
-    # given the density and velocity, returns the lift force [N]
-
-def drag(p, V): # p: density [kg/m3] ; V: velocity [m/s]
-    return 1/2 * area * Cx * p * V**2
-    # given the density and velocity, returns the drag force [N]
-
-def gravity(h): # h: altitude [km]
-    rad = R+h               # distance from Earth center [km]
-    return g0 * (R / rad)**2
-    # given the altitude, returns the gravity acceleration [m/s²]
+def simulation(h0, V0, y0, planet_data, vehicle_data):
+    """ Right-hand term of the equation (3a) with Phi = 0
+    Parameters
+    ----------
+    h0 : scalar [km]
+        initial altitude
+    V0 : scalar [m/s]
+        initial velocity (negative means the trajectory is counter-clockwise)
+    y0 : scalar [°]
+        initial flight-path angle (negative means the velocity vector is towards 
+        the Earth)
+    planet_data : list
+        list that contains planetary settings: 
+            - R : scalar [km]
+                planetary radius
+            - g0 : scalar [m/s²]
+                gravity at surface
+            - atmos : func
+                function of the atmosphere's density as with the altitude
+    vehicle_data : list
+        list that contains vehicle settings :
+            - surface_area : scalar [m²]
+                cross section of the vehicle
+            - mass : scalar [kg]
+                vehicle's mass
+            - Cx : scalar
+                drag coefficient
+            - Cz : scalar
+                lift coefficient
+	
+    Returns
+    -------
+    altitude
+	- altitude
+	- velocity
+	- flight-path angle
+	- time
+	- rotation angle
+	- Pdyn
+	- drag
+	- weight
+	- number of g
+	- kinetic energy
     
-def density(h): # h: altitude [km]
-    h = h*1000                        # conversion from km to m
-    return p0*np.exp(-1.378e-4 * h)
+    Other Parameters (see Notes)
+    ----------------
+    dT : scalar [s]
+        time step size
+    Tmax : scalar [s]
+        maximum time for a simulation running
+    O0 : scalar [°]
+        initial position angle of the spacecraft.
+	- dT
+	- Tmax
+	- O0
+	- x_vec
+	- y_vec
+	
+    
+    Notes
+    -----
+    """
+    # Simulation settings :
+    dT = 0.1                            # time step size [s]
+    Tmax = 1e4                          # max. time for a simulation [s]
+    O0 = 90                             # initial position of the spacecraft with Earth [°]
+    x_E = np.array([1,0])               # X vector (fixed)
+    y_E = np.array([0,1])               # Y vector (fixed)
+    R = planet_data[0]                  # planet radius [km]
+    g0 = planet_data[1]                 # planet gravity magnitude on the ground
+    func_density = planet_data[2]       # density function for the planet's atmosphere
+    surface_area = vehicle_data[0]      # surface area of the vehicle [m²]
+    mass0 = vehicle_data[1]              # mass of the vehicle [kg]
+    Cx = vehicle_data[2]                # drag coefficient
+    Cz = vehicle_data[3]                # lift coefficient
+	
+	# Functions
+    def mass_variation(altitude):
+        if altitude > 100:
+            return mass0
+        else:
+            return (mass0 - 30) / 100 * altitude + 30
+        
+    def dynamic_pressure(density, velocity):
+        """ Return the dynamic pressure for the spacecraft
+        """
+        return 1/2 * surface_area * density * velocity**2
+    
+    def gravity(altitude):
+        """ Return the magnitude of the gravity force according to the 
+            distance (altitude) from what is supposed to be the center of mass
+            of the attractor body.
+        """
+        return g0 * (R / (R + altitude))**2
+    
+    def vector_angle(u_ini, u_end):
+        """ Return the angle between two vectors, positive if counter
+            clockwise.
+        """
+        acos_angle = np.dot(u_ini, u_end) / (np.linalg.norm(u_ini) * np.linalg.norm(u_end))
+        if np.abs(acos_angle - 1) < 1e-15:
+            acos_angle = 1
+        sign = np.sign(np.cross(u_ini, u_end))
+        return sign * math.acos(acos_angle) * 180 / np.pi
+    
+    def basis_change(u, angle):
+        """ Return the value of a vector that has been rotated by an angle
+        """
+        angle = angle / 180 * np.pi
+        return np.array([u[0] * np.cos(angle) - u[1] * np.sin(angle),
+                         u[0] * np.sin(angle) + u[1] * np.cos(angle)])
+	
+    # Initialization :
+    time = np.array([0])
+    altitude = np.array([h0])
+    mass = mass_variation(altitude[-1])
+    rotation = np.array([O0])
+    x_S = basis_change(x_E, rotation[-1] - 90)  #(in x_E, y_E basis)
+    y_S = basis_change(y_E, rotation[-1] - 90)  #(in x_E, y_E basis)
+    flight_path = np.array([y0])
+    x_V = basis_change(x_S, flight_path[-1])    # in x_E, y_E basis
+    y_V = basis_change(y_S, flight_path[-1])    # in x_E, y_E basis
+    
+    velocity = np.array([V0])
+    density = np.array([func_density(altitude[-1])])
+    Pdyn = np.array([dynamic_pressure(density[-1], velocity[-1])])
+    Drag = np.array([Pdyn[-1] * Cx])
+    Lift = np.array([Pdyn[-1] * Cz])
+    Weight = np.array([gravity(altitude[-1])]) * mass
+    acceleration = np.array([1 / mass * (- Drag[-1] * x_V + Lift[-1] * y_V - Weight[-1] * y_S)])        # xE, yE basis
+    g_acc = np.array([np.linalg.norm(acceleration[-1]) / gravity(altitude[-1])])
+    energy = np.array([ 1 / 2 * mass * np.linalg.norm(velocity[-1])**2])
+	
+	# Simulation :
+    while ((altitude[-1] > 0) and (time[-1] < Tmax)):
+        vel_temp = velocity[-1] * x_V                   # V0
+        acc_temp = acceleration[-1]                     # g0
+        r1_temp = (R+altitude[-1]) * y_S                # r0
+        r2_temp = r1_temp + dT * vel_temp / 1000        # r1
+        vel_temp = vel_temp + dT * acc_temp             # V1
+        time = np.append(time, time[-1] + dT)
+        altitude = np.append(altitude, np.linalg.norm(r2_temp) - R)
+        mass = mass_variation(altitude[-1])
+        rotation = np.append(rotation, rotation[-1] + vector_angle(r1_temp, r2_temp))
+        x_S = basis_change(x_E, rotation[-1] - 90)
+        y_S = basis_change(y_E, rotation[-1] - 90)
+        flight_path = np.append(flight_path, vector_angle(x_S, vel_temp))
+        x_V = basis_change(x_S, flight_path[-1])
+        y_V = basis_change(y_S, flight_path[-1])
+        
+        velocity = np.append(velocity, np.linalg.norm(vel_temp))
+        density = np.append(density, func_density(altitude[-1]))
+        Pdyn = np.append(Pdyn, dynamic_pressure(density[-1], velocity[-1]))
+        Drag = np.append(Drag, Pdyn[-1] * Cx)
+        Lift = np.append(Lift, Pdyn[-1] * Cz)
+        Weight = np.append(Weight, gravity(altitude[-1]) * mass)
+        acceleration = np.append(acceleration, np.array([1 / mass * (- Drag[-1] * x_V + Lift[-1] * y_V - Weight[-1] * y_S)]), axis=0)
+        g_acc = np.append(g_acc, np.linalg.norm(acceleration[-1]) / gravity(altitude[-1]))
+        energy = np.append(energy, 1 / 2 * mass * np.linalg.norm(velocity[-1])**2)
+	
+    if time[-1] < Tmax:
+        altitude[-1] = 0
+	
+    # Printing
+    print('')
+    print('Time of flight : ' + repr(time[-1]) + 's')
+    print('Terminal velocity : ' + repr(np.linalg.norm(velocity[-1])) + ' m/s')
+    print('Maximum deceleration : ' + repr(max(g_acc)) + ' g')
+    return time, altitude, velocity, flight_path, rotation, density, Pdyn, Drag, Lift, Weight, acceleration, g_acc, energy
 
-##########################
-#    Re-entry flight     #
-##########################
-def reentry(h, V, y, T): # h : altitude [km] ; V : velocity vector in Rv
-    global dT
-    # Let us assume that we will use 3 coordinate systems :
-    # 1/ Rv is relative to the spacecraft velocity so that : x-axis is given by V
-    #                                                        y-axis is away from Earth
-    # 2/ Rs is relative to the spacecraft local horizon :    x-axis is along the local horizon (clockwise motion)
-    #                                                        y-axis is away from Earth
-    # 3/ Re is relative to the Earth center :                z-axis is along the Earth rotational axis
-    # The initial position of the spacecraft with this coordinate system is Rs : (0, h0)
-    
-    # Computation :
-    p = density(h)                              # density of the air [kg/m3]
-    g = gravity(h)                              # magnitude of the gravity [m/s²]
-    D = np.array([-drag(p, module(V)), 0])      # drag vector (Rv)
-    L = np.array([0, lift(p, module(V))])       # lift vector (Rv)
-    W = np.array([0, - g * mass])               # Weight vector (Rs)
-    V = coordinate_switch(V, [y])               # Velocity vector switch to Rs
-    D = coordinate_switch(D, [y])               # Drag vector (Rs)
-    L = coordinate_switch(L, [y])               # Lift vector (Rs)
-    Acc = 1 / mass * (L + W + D)                # Dynamic equation : G = Sum(F) / mass (Rs)
-    dV = Acc * dT                               # dV vector [m/s] (Rs)
-    dh = V[1] * dT / 1000                       # vertical velocity magnitude [km/s]
-    h = h + dh                                  # altitude [km]
-    V = V + dV                                  # velocity vector [m/s](Rs)
-    y = vec_angle(V)                            # flight path angle (velocity against local horizon for Rs)
-    T = T + dT                                  # time
-    V = coordinate_switch(V, [-y])              # velocity vector [m/s] (Rv)
-    
-    
-    
-    any_data = np.array([module(D), module(W), module(Acc), g])    
-    # This one is truly special as Rey in SW8
-    # It containts any useful data we want to get as an output
-    
-    return h, V, y, T, any_data
-    # returns altitude, velocity vector, y angle (°) and time in Rs coordinate system
 
+def density_USSA76(altitude):
+    """Compute the density of the atmosphere for altitudes from sea level to 1,000 km high
+        using exponential interpolation.
+        Reference : U.S. Standard Atmosphere, 1976
+        [https://ntrs.nasa.gov/archive/nasa/casi.ntrs.nasa.gov/19770009539.pdf]
+    """
+    # Set of altitudes [km] :
+    h = np.array([0, 25, 30, 40, 50, 60, 70, 
+                  80, 90, 100, 110, 120, 130, 140, 
+                  150, 180, 200, 250, 300, 350, 400, 
+                  450, 500, 600, 700, 800, 900, 1000])
+    
+    # Corresponding USSA76 density [kg/m3] :
+    r = np.array([1.225,     4.008e-2,  1.841e-2,  3.996e-3,  1.027e-3,  3.097e-4,  8.283e-5,
+                  1.846e-5,  3.416e-6,  5.606e-7,  9.708e-8,  2.222e-8,  8.152e-9,  3.831e-9,
+                  2.076e-9,  5.194e-10, 2.541e-10, 6.073e-11, 1.916e-11, 7.014e-12, 2.803e-12,
+                  1.184e-12, 5.215e-13, 1.137e-13, 3.070e-14, 1.136e-14, 5.759e-15, 3.561e-15])
+	# Scale heights [km] for the exponential approximation
+    alpha = np.array([ 7.310,  6.427,  6.546,   7.360,   8.342,   7.583,  6.661,
+                      5.927,  5.533,  5.703,   6.782,   9.973,  13.243, 16.322,
+                      21.652, 27.974, 34.934,  43.342,  49.755,  54.513, 58.019,
+                      60.980, 65.654, 76.377, 100.587, 147.203, 208.020])
+	# Handle altitudes outside of the range :
+    if (altitude > 1000):
+        altitude = 1000
+    elif (altitude < 0) :
+        altitude = 0
+	# Exponential interpolation :
+    for i in range (len(h)-1):
+        if ((altitude >= h[i]) and (altitude < h[i+1])) :
+            return r[i] * np.exp(-(altitude - h[i]) / alpha[i])
+        if altitude == 1000:
+            return r[-2] * np.exp(-(altitude - h[-2]) / alpha[-1])	
 
 ###########################################
 #                CONSTANTS                #
 ###########################################
-# General constants
-Pi2 = 2 * np.pi
 
 # Earth characteristics
 R = 6371.008                # Earth radius [km]
 g0 = 9.80665                # Earth gravity at surface [m/s²]
-p0 = 1.225                  # Air density at sea level [kg/m3]
+p0 = 1.225
 
 # Lander characteristics
-radius = 1                  # cross section radius [m]
+radius = 0.55                  # cross section radius [m]
 area = np.pi * radius**2    # cross section area [m²]
 Cz = 0                      # lift coefficient []
 Cx = 1.15                   # drag coefficient []
-mass = 500                  # mass [kg]
+mass0 = 80                  # mass [kg]
+nradius = 60e-2             # nose radius [m]
+cflow = 1.705e-7            # C constant for heatflow
 
 # Flight characteristics
-h0 = 100                    # initial height [km]
-V0 = 12000                  # initial velocity [m/s]
-y0 = -20                    # initial flight-path angle (°)
-dT = 0.1                    # Step size (s)
+h0 = 500                    # initial height [km]
+V0 = 12800                  # initial velocity [m/s]
+y0 = -30                    # initial flight-path angle (°)
+
 
 ###########################################
 #             SIMULATION                  #
 ###########################################
-# Initialization
-h = h0
-V = np.array([V0, 0])
-y = y0
-T = 0
-i=1
+# Heat calculus
+beta = area * Cx / mass0
+k0 = (p0 * beta* 7100) / np.sin(y0)
+#maxF = (cflow / nradius**0.5)*((-p0/(3*k0*2.72)**0.5)*V0**3)       # Maximum Heat flow (kW/m²) 
+#print('Maximum heat flow : ' + str(maxF) +' kW/m²')
 
-while h > 0:
-    h, V, y, T, data = reentry(h, V, y, T)
-    i = i+1
-    # This piece of code is supposed to return the length of the state-vector
-    # Basically it computes all the simulation in order to know precisely the length
-    # Hence a huge loss of resources (not that much as for time, program is pretty fast)
 
-# State-vector initialization
-h = np.zeros(i)
-h[0] = h0                   # h is the altitude vector starting from h0 to ~ 0 km
-
-V = np.zeros((i,2))
-V[0] = np.array([V0, 0])    # V is the velocity vector {Vx, Vy} in Rv frame from Vini to Vfinal
-
-y = np.zeros(i)
-y[0] = y0                   # y is the flight-path angle vector from y0 to -90°
-
-T = np.zeros(i)             # T is the time vector starting from 0 til the end of flight, evenly spaced by dT
-
-Velocity = np.zeros(i)
-Velocity[0] = V0            # velocity computes the module of the velocity vector at each step
-
-Acceleration = np.zeros(i)  # acceleration is the acceleration [g] vector
-
-Drag = np.zeros(i)
-
-Weight = np.zeros(i)
-
-Kinetic_energy = np.zeros(i)
-Kinetic_energy[0] = 1 / 2 * mass * V0**2 # kinetic energy
-
-k = 0
-while h[k]>0:
-    h[k+1], V[k+1], y[k+1], T[k+1], data = reentry(h[k], V[k], y[k], T[k])
-        # Tip : "data" contains the following vector modules : [D, W, Acc, g]
-    Velocity[k+1] = module(V[k+1])
-    Acceleration[k+1] = data[2] / data[3] # Computes the value of acceleration in g-number
-    Drag[k+1] = data[0]
-    Weight[k+1] = data[1]
-    Kinetic_energy[k+1] = 1 / 2 * mass * Velocity[k+1]**2
-    k = k+1
-    # This fills all the state vectors above.
+T, h, V, y, o, p, P, D, L, W, G, g, K = simulation(h0, V0, y0, [R, g0, density_USSA76], [area, mass0, Cx, Cz])
     
-    
+
 ###########################################
 #                   PLOT                  #
 ###########################################
 
-# Figure 1 : Plot velocity against time (normal & semi-log)
-pyplot.figure(figsize=(12,4))
-pyplot.subplot(1,2,1)
-pyplot.plot(T, Velocity)
-pyplot.xlabel('Time [s]')
-pyplot.ylabel('Velocity [m/s]')
-pyplot.title('Velocity against time (normal)')
-pyplot.subplot(1,2,2)
-pyplot.yscale('log')
-pyplot.plot(T, Velocity)
-pyplot.xlabel('Time [s]')
-pyplot.ylabel('Velocity [m/s]')
-pyplot.title('Velocity against time (semi-log)')
-        
-# Figure 2 : Plot velocity against altitude (normal & semi-log)
-pyplot.figure(figsize=(12,4))    
-pyplot.subplot(1,2,1)
-pyplot.plot(h, Velocity)
-pyplot.xlabel('Altitude [km]')
-pyplot.ylabel('Velocity [m/s]')
-pyplot.title('Velocity against altitude (normal)')
-pyplot.subplot(1,2,2)
-pyplot.yscale('log')
-pyplot.plot(h, Velocity)
-pyplot.xlabel('Altitude [km]')
-pyplot.ylabel('Velocity [m/s]')
-pyplot.title('Velocity against altitude (semi-log)')
+## Figure 1 : Plot velocity against time (normal & semi-log)
+#pyplot.figure(figsize=(12,4))
+#pyplot.subplot(1,2,1)
+#pyplot.plot(T, V[:,0])
+#pyplot.xlabel('Time [s]')
+#pyplot.ylabel('Velocity [m/s]')
+#pyplot.title('Velocity against time (normal)')
+#pyplot.subplot(1,2,2)
+#pyplot.yscale('log')
+#pyplot.plot(T, V[:,0])
+#pyplot.xlabel('Time [s]')
+#pyplot.ylabel('Velocity [m/s]')
+#pyplot.title('Velocity against time (semi-log)')
+#        
+## Figure 2 : Plot velocity against altitude (normal & semi-log)
+#pyplot.figure(figsize=(12,4))    
+#pyplot.subplot(1,2,1)
+#pyplot.plot(h, V[:,0])
+#pyplot.xlabel('Altitude [km]')
+#pyplot.ylabel('Velocity [m/s]')
+#pyplot.title('Velocity against altitude (normal)')
+#pyplot.subplot(1,2,2)
+#pyplot.yscale('log')
+#pyplot.plot(h, V[:,0])
+#pyplot.xlabel('Altitude [km]')
+#pyplot.ylabel('Velocity [m/s]')
+#pyplot.title('Velocity against altitude (semi-log)')
+#
+## Figure 3 : Plot y against altitude (normal), against time (normal)
+#pyplot.figure(figsize=(12,4))
+#pyplot.subplot(1,2,1)
+#pyplot.plot(h, y)
+#pyplot.xlabel('Altitude [km]')
+#pyplot.ylabel('Flight path angle [°]')
+#pyplot.title('Flight path angle against altitude (normal)')
+#pyplot.subplot(1,2,2)
+#pyplot.plot(T, y)
+#pyplot.xlabel('Time [s]')
+#pyplot.ylabel('Flight path angle [°]')
+#pyplot.title('Flight path angle against time (normal)')
+#
+## Figure 4 : Plot altitude against time (normal)
+#pyplot.figure(figsize=(12,4))
+#pyplot.plot(T,h)
+#pyplot.xlabel('Time [s]')
+#pyplot.ylabel('Altitude [km]')
+#pyplot.title('Altitude against time (normal)')
+#
+## Figure 5 : Plot acceleration against altitude (normal), against time (normal)
+#pyplot.figure(figsize=(12,4))
+#pyplot.subplot(1,2,1)
+#pyplot.plot(h, g)  # Without the first point at t = 0
+#pyplot.xlabel('Altitude [km]')
+#pyplot.ylabel('Acceleration [g]')
+#pyplot.title('Acceleration against altitude (normal)')
+#pyplot.subplot(1,2,2)
+#pyplot.plot(T, g)  # Without the first point at t = 0
+#pyplot.xlabel('Time [s]')
+#pyplot.ylabel('Acceleration [g]')
+#pyplot.title('Acceleration against time (normal)')
+#
+## Figure 6 : Plot Drag force & Weight force against altitude (log)
+#pyplot.figure(figsize=(12,4))
+#pyplot.yscale('log')
+#pyplot.plot(h[1::], Drag[1::])          # Without the first point at t = 0
+#pyplot.plot(h[1::], Weight[1::])        # Without the first point at t = 0
+#pyplot.xlabel('Altitude [km]')
+#pyplot.ylabel('Force [N]')
+#pyplot.title('Magnitude of the forces exerced on the vehicle against altitude (log)')
+#pyplot.legend(('Drag force', 'Weight force'))
+#
+## Figure 7 : Plot Drag force & Weight force against time (log)
+#pyplot.figure(figsize=(12,4))
+#pyplot.yscale('log')
+#pyplot.plot(T[1::], Drag[1::])          # Without the first point at t = 0
+#pyplot.plot(T[1::], Weight[1::])        # Without the first point at t = 0
+#pyplot.xlabel('Time [s]')
+#pyplot.ylabel('Force [N]')
+#pyplot.title('Magnitude of the forces exerced on the vehicle against time (log)')
+#pyplot.legend(('Drag force', 'Weight force'))
+#
+## Figure 8 : Plot kinetic energy against altitude (normal), against time (normal)
+#Ke = 1 / 2 * mass * np.power(Velocity, 2*np.ones(len(Velocity)))	# Kinetic energy formula
+#pyplot.figure(figsize=(12,4))
+#pyplot.subplot(1,2,1)
+#pyplot.plot(h, Ke)
+#pyplot.xlabel('Altitude [km]')
+#pyplot.ylabel('Kinetic energy [J]')
+#pyplot.title('Kinetic energy against altitude (normal)')
+#pyplot.subplot(1,2,2)
+#pyplot.plot(T, Ke)
+#pyplot.xlabel('Time [s]')
+#pyplot.ylabel('Kinetic energy [J]')
+#pyplot.title('Kinetic energy against time (normal)')
 
-# Figure 3 : Plot y against altitude (normal), against time (normal)
-pyplot.figure(figsize=(12,4))
-pyplot.subplot(1,2,1)
-pyplot.plot(h, y)
-pyplot.xlabel('Altitude [km]')
-pyplot.ylabel('Flight path angle [°]')
-pyplot.title('Flight path angle against altitude (normal)')
-pyplot.subplot(1,2,2)
-pyplot.plot(T, y)
-pyplot.xlabel('Time [s]')
-pyplot.ylabel('Flight path angle [°]')
-pyplot.title('Flight path angle against time (normal)')
-
-# Figure 4 : Plot altitude against time (normal)
-pyplot.figure(figsize=(12,4))
-pyplot.plot(T,h)
-pyplot.xlabel('Time [s]')
-pyplot.ylabel('Altitude [km]')
-pyplot.title('Altitude against time (normal)')
-
-# Figure 5 : Plot acceleration against altitude (normal), against time (normal)
-pyplot.figure(figsize=(12,4))
-pyplot.subplot(1,2,1)
-pyplot.plot(h[1::], Acceleration[1::])  # Without the first point at t = 0
-pyplot.xlabel('Altitude [km]')
-pyplot.ylabel('Acceleration [g]')
-pyplot.title('Acceleration against altitude (normal)')
-pyplot.subplot(1,2,2)
-pyplot.plot(T[1::], Acceleration[1::])  # Without the first point at t = 0
-pyplot.xlabel('Time [s]')
-pyplot.ylabel('Acceleration [g]')
-pyplot.title('Acceleration against time (normal)')
-
-# Figure 6 : Plot Drag force & Weight force against altitude (log)
-pyplot.figure(figsize=(12,4))
-pyplot.yscale('log')
-pyplot.plot(h[1::], Drag[1::])          # Without the first point at t = 0
-pyplot.plot(h[1::], Weight[1::])        # Without the first point at t = 0
-pyplot.xlabel('Altitude [km]')
-pyplot.ylabel('Force [N]')
-pyplot.title('Magnitude of the forces exerced on the vehicle against altitude (log)')
-pyplot.legend(('Drag force', 'Weight force'))
-
-# Figure 7 : Plot Drag force & Weight force against time (log)
-pyplot.figure(figsize=(12,4))
-pyplot.yscale('log')
-pyplot.plot(T[1::], Drag[1::])          # Without the first point at t = 0
-pyplot.plot(T[1::], Weight[1::])        # Without the first point at t = 0
-pyplot.xlabel('Time [s]')
-pyplot.ylabel('Force [N]')
-pyplot.title('Magnitude of the forces exerced on the vehicle against time (log)')
-pyplot.legend(('Drag force', 'Weight force'))
-
-# Figure 8 : Plot Kinetic energy against time, altitude
-pyplot.figure(figsize=(12,4))
-pyplot.subplot(1,2,1)
-pyplot.plot(h, Kinetic_energy)
-pyplot.xlabel('Altitude [km]')
-pyplot.ylabel('Kinetic energy [J]')
-pyplot.title('kinetic energy against altitude (normal)')
-pyplot.subplot(1,2,2)
-pyplot.plot(T, Kinetic_energy)
-pyplot.xlabel('Time [s]')
-pyplot.ylabel('Kinetic energy [J]')
-pyplot.title('kinetic energy against time (normal)')
+# Figure 9 : Plot trajectory
+R_x = (R + h) * np.cos(o/180*np.pi)			# x component of the spacecraft trajectory
+R_y = (R + h) * np.sin(o/180*np.pi)			# y component of the spacecraft trajectory
+Re_x = R * np.cos(o/180*np.pi)				# x component of the Earth ground
+Re_y = R * np.sin(o/180*np.pi) 				# y component of the Earth ground
+pyplot.figure(figsize=(12,12))
+pyplot.plot(R_x, R_y, 'b')
+pyplot.plot(Re_x, Re_y, 'k')
+pyplot.xlabel('x vector [km]')
+pyplot.ylabel('y vector [km]')
+pyplot.title('Trajectory of the spacecraft')
+pyplot.legend(('Spacecraft', 'Ground'))
+pyplot.axis('equal')
