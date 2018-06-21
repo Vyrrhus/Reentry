@@ -1,4 +1,4 @@
-# @author : Camille LEONI
+# @author : Baptiste DESOUBRIE
 """
 PRELIMINARY RE-ENTRY SIMULATION
 
